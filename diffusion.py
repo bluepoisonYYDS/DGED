@@ -97,7 +97,6 @@ class GaussianDiffusion(nn.Module):
         self.l2_weight = l2_weight
 
         if schedule_opt is not None:
-            # 延迟到 set_new_noise_schedule 中完成初始化
             pass
 
     def set_loss(self, device):
@@ -112,7 +111,7 @@ class GaussianDiffusion(nn.Module):
             self.l1_weight = 0.0
             self.l2_weight = 1.0
         elif self.loss_type == 'mixed':
-            pass  # 使用用户指定的权重
+            pass
         else:
             raise NotImplementedError()
 
@@ -135,7 +134,6 @@ class GaussianDiffusion(nn.Module):
         self.register_buffer('alphas_cumprod_prev',
                              to_torch(alphas_cumprod_prev))
 
-        # calculations for diffusion q(x_t | x_{t-1}) and others
         self.register_buffer('sqrt_alphas_cumprod',
                              to_torch(np.sqrt(alphas_cumprod)))
         self.register_buffer('sqrt_one_minus_alphas_cumprod',
@@ -147,7 +145,6 @@ class GaussianDiffusion(nn.Module):
         self.register_buffer('sqrt_recipm1_alphas_cumprod',
                              to_torch(np.sqrt(1. / alphas_cumprod - 1)))
 
-        # calculations for posterior q(x_{t-1} | x_t, x_0)
         posterior_variance = betas * \
             (1. - alphas_cumprod_prev) / (1. - alphas_cumprod)
         self.register_buffer('posterior_variance',
@@ -159,7 +156,6 @@ class GaussianDiffusion(nn.Module):
         self.register_buffer('posterior_mean_coef2', to_torch(
             (1. - alphas_cumprod_prev) * np.sqrt(alphas) / (1. - alphas_cumprod)))
 
-        # 同时初始化损失函数（放到同一个 device）
         self.set_loss(device)
 
     def q_mean_variance(self, x_start, t):
@@ -169,9 +165,16 @@ class GaussianDiffusion(nn.Module):
             self.log_one_minus_alphas_cumprod, t, x_start.shape)
         return mean, variance, log_variance
 
-    # ------------------------------------------------------------------
-    # 关键修正：抛弃 predict_start_from_noise，直接使用网络输出作为重建的 x0
-    # ------------------------------------------------------------------
+    def predict_start_from_noise(self, x_t, t, noise):
+        """
+        从噪声预测结果重建 x0：
+        x0 = (x_t - sqrt(1-α̅_t) * noise) / sqrt(α̅_t)
+        """
+        return (
+            extract(self.sqrt_recip_alphas_cumprod, t, x_t.shape) * x_t -
+            extract(self.sqrt_recipm1_alphas_cumprod, t, x_t.shape) * noise
+        )
+
     def q_posterior(self, x_start, x_t, t):
         posterior_mean = (
             extract(self.posterior_mean_coef1, t, x_t.shape) * x_start +
@@ -184,16 +187,19 @@ class GaussianDiffusion(nn.Module):
 
     def p_mean_variance(self, x, t, clip_denoised: bool, condition_x=None):
         """
-        使用去噪网络直接预测重建的 x0，然后通过后验分布计算去噪均值与方差。
+        网络预测噪声 ε，由此重建 x0，再计算后验均值与方差。
         """
         if condition_x is not None:
-            # 条件拼接，输入通道：条件(6) + 含噪体素(6) = 12
-            x_recon = self.denoise_fn(torch.cat([condition_x, x], dim=1), t)
+            # 输入通道：条件(6) + 含噪体素(6) = 12
+            pred_noise = self.denoise_fn(torch.cat([condition_x, x], dim=1), t)
         else:
-            x_recon = self.denoise_fn(x, t)
+            pred_noise = self.denoise_fn(x, t)
+
+        # 由预测噪声重建 x0
+        x_recon = self.predict_start_from_noise(x, t, pred_noise)
 
         if clip_denoised:
-            x_recon.clamp_(-1., 1.)
+            x_recon.clamp_(0., 1.)
 
         model_mean, posterior_variance, posterior_log_variance = self.q_posterior(
             x_start=x_recon, x_t=x, t=t)
@@ -205,7 +211,6 @@ class GaussianDiffusion(nn.Module):
         model_mean, _, model_log_variance = self.p_mean_variance(
             x=x, t=t, clip_denoised=clip_denoised, condition_x=condition_x)
         noise = noise_like(x.shape, device, repeat_noise)
-        # no noise when t == 0
         nonzero_mask = (1 - (t == 0).float()).reshape(b,
                                                       *((1,) * (len(x.shape) - 1)))
         return model_mean + nonzero_mask * (0.5 * model_log_variance).exp() * noise
@@ -240,7 +245,7 @@ class GaussianDiffusion(nn.Module):
         if continous:
             return ret_img
         else:
-            return ret_img[-1]   # 注意：这里是返回 batch 维度上最后一张图，如果是拼接可能维度错；保持原样，但建议外部处理
+            return ret_img[-1]
 
     @torch.no_grad()
     def sample(self, batch_size=1, continous=False):
@@ -280,8 +285,8 @@ class GaussianDiffusion(nn.Module):
 
     def p_losses(self, x_in, noise=None):
         """
-        训练损失：模型直接预测重建的 x0，与真值计算 L1/L2 混合损失。
-        要求 x_in 字典包含：
+        训练损失：模型预测噪声 ε，与真实噪声计算混合损失。
+        x_in 字典：
             'HR': 事件体素真值 (b,6,h,w)
             'condition': 模糊图 B 与细节引导 P 的拼接 (b,6,h,w)
         """
@@ -293,15 +298,16 @@ class GaussianDiffusion(nn.Module):
         x_noisy = self.q_sample(x_start=x_start, t=t, noise=noise)
 
         if not self.conditional:
-            x_recon = self.denoise_fn(x_noisy, t)
+            pred_noise = self.denoise_fn(x_noisy, t)
         else:
             condition = x_in['condition']          # (b,6,h,w)
-            x_recon = self.denoise_fn(
+            pred_noise = self.denoise_fn(
                 torch.cat([condition, x_noisy], dim=1), t
             )
 
-        loss = self.l1_loss(x_recon, x_start) * self.l1_weight + \
-               self.l2_loss(x_recon, x_start) * self.l2_weight
+        # 损失计算在噪声上
+        loss = self.l1_loss(pred_noise, noise) * self.l1_weight + \
+               self.l2_loss(pred_noise, noise) * self.l2_weight
         return loss
 
     def forward(self, x, *args, **kwargs):

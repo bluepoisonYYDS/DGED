@@ -46,7 +46,7 @@ class ResBlock(nn.Module):
 # ----------------------------
 # 加重版循环稠密化网络
 # ----------------------------
-class HeavyE_CIR(nn.Module):
+class DV(nn.Module):
     """
     将稀疏事件体素 + 模糊图像 -> 稠密边缘图
     增加参数量的手段：

@@ -319,7 +319,7 @@ class DecoderStage(nn.Module):
         return x
 
 # -------------------- 完整模型 --------------------
-class EventImageDeblurNet(nn.Module):
+class DSE(nn.Module):
     def __init__(self, img_ch=3, event_ch=1, base_ch=16, window_size=8,
                  drop_rate=0.02,        # 全局 Dropout 率
                  attn_drop=0.05,        # Attention 内部的 Dropout 率
@@ -435,7 +435,7 @@ if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     # 初始化模型，启用所有正则化（drop_rate=0.1, drop_path=0.1）
-    model = EventImageDeblurNet(
+    model = DSE(
         img_ch=3, event_ch=6, base_ch=64, window_size=8,
         drop_rate=0.1, attn_drop=0.1, drop_path_rate=0.1
     ).to(device)

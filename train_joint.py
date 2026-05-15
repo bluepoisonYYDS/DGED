@@ -15,23 +15,23 @@ import torchvision.models as models
 from torchvision.models import vgg19, VGG19_Weights
 
 # 导入原始大模型，稍后将被包装
-from model_large import EventImageDeblurNet
-from DV import HeavyE_CIR
+from DSE import DSE
+from DV import DV
 from eval import evaluate_psnr_ssim
 
 class JointDeblurModel(nn.Module):
     """
-    先使用 HeavyE_CIR 将事件体素转化为稠密边缘图，
+    先使用 DV 将事件体素转化为稠密边缘图，
     再将边缘图与模糊图像一起送入去模糊大模型。
     """
     def __init__(self, deblur_net_args):
         super().__init__()
         # 稠密化网络（固定 event_bins=6，与原数据集一致）
-        self.densifier = HeavyE_CIR(event_bins=6, hidden_dim=128, img_feat_dim=32)
+        self.densifier = DV(event_bins=6, hidden_dim=128, img_feat_dim=32)
 
         # 修改大模型的 event_ch 为 1，使其接收边缘图
         deblur_net_args['event_ch'] = 1
-        self.deblur_net = EventImageDeblurNet(**deblur_net_args)
+        self.deblur_net = DSE(**deblur_net_args)
 
     def forward(self, blur_img, event_voxel):
         # 1. 生成稠密边缘图
@@ -390,27 +390,38 @@ def main(args):
 
     # 恢复训练
     start_epoch = 0
+    dv_epoch = 0
+    dse_epoch = 0
     best_val_loss = float('inf')
-    if args.resume and os.path.isfile(args.resume):
-        ckpt = torch.load(args.resume, map_location=device)
-        model.load_state_dict(ckpt['model_state_dict'])
-        optimizer.load_state_dict(ckpt['optimizer_state_dict'])
-        for param_group in optimizer.param_groups:
-            param_group['lr'] = args.lr
-        if scheduler is not None and 'scheduler_state_dict' in ckpt:
-            scheduler.load_state_dict(ckpt['scheduler_state_dict'])
-        start_epoch = ckpt['epoch'] + 1
-        best_val_loss = ckpt.get('best_val_loss', best_val_loss)
-        print(f"从 epoch {start_epoch} 恢复训练，当前学习率: {args.lr}")
+    if args.resume_DV and os.path.isfile(args.resume_DV):
+        dv_state = torch.load(args.resume_DV, map_location=device)
+        model.densifier.load_state_dict(dv_state['model_state_dict'])
+        optimizer.load_state_dict(dv_state['optimizer_state_dict'])
+        if scaler and 'scaler' in dv_state:
+            scaler.load_state_dict(dv_state['scaler'])
+        dv_epoch = dv_state['epoch'] + 1
+        best_val_loss = dv_state.get('best_val_loss', best_val_loss)
+        print(f"从 DV checkpoint 恢复，epoch: {dv_epoch}, val loss: {best_val_loss:.6f}")
+    if args.resume_DSE and os.path.isfile(args.resume_DSE):
+        dse_state = torch.load(args.resume_DSE, map_location=device)
+        model.deblur_net.load_state_dict(dse_state['model_state_dict'])
+        dse_epoch = dse_state['epoch'] + 1
+        best_val_loss = min(best_val_loss, dse_state.get('best_val_loss', float('inf')))
+        print(f"从 DSE checkpoint 恢复，epoch: {dse_epoch}, val loss: {best_val_loss:.6f}")   
+    start_epoch = max(dv_epoch, dse_epoch)
+    if(dv_epoch != dse_epoch):
+        print(f"警告：DV checkpoint epoch ({dv_epoch}) 与 DSE checkpoint epoch ({dse_epoch}) 不一致，可能导致训练不连续！")
 
-    os.makedirs(args.save_dir, exist_ok=True)
+    os.makedirs(args.save_dir_DV, exist_ok=True)
+    os.makedirs(args.save_dir_DSE, exist_ok=True)
+    os.makedirs(args.save_dir_log, exist_ok=True)
     # 创建评估日志文件
-    eval_log_path = args.eval_log if args.eval_log else os.path.join(args.save_dir, 'eval_metrics.txt')
+    eval_log_path = os.path.join(args.save_dir_log, 'eval_metrics.txt')
     if start_epoch == 0:  # 仅在初始训练时创建并写入表头
         with open(eval_log_path, 'w') as f:
             f.write("Epoch\tPSNR(dB)\tSSIM\n")
     # 创建损失日志文件
-    loss_log_path = args.loss_log if args.loss_log else os.path.join(args.save_dir, 'loss_log.txt')
+    loss_log_path = os.path.join(args.save_dir_log, 'loss_log.txt')
     if start_epoch == 0:  # 仅在初始训练时创建并写入表头
         with open(loss_log_path, 'w') as f:
             f.write("Epoch\tTrain Loss\tval Loss\n")
@@ -428,11 +439,12 @@ def main(args):
         if scheduler is not None:
             scheduler.step()
         lr = optimizer.param_groups[0]['lr']
+        lr = adjust_learning_rate(optimizer, epoch, warmup_epochs, base_lr, warmup_lr_init)
         print(f"Train Loss: {train_loss:.6f} | val Loss: {val_loss:.6f} | LR: {lr:.6f}")
 
         #查看梯度消失情况
         if epoch == start_epoch or (epoch + 1) % 10 == 0:  # 每隔 10 个 epoch 检查一次梯度流
-            save_path = os.path.join(args.save_dir, f'gradient_flow_epoch{epoch+1}.txt')
+            save_path = os.path.join(args.save_dir_log, f'gradient_flow_epoch{epoch+1}.txt')
             check_gradient_flow(model, save_path=save_path)
         # 日志记录
         with open(loss_log_path, 'a') as f:
@@ -449,29 +461,35 @@ def main(args):
             best_val_loss = val_loss
             torch.save({
                 'epoch': epoch,
-                'model_state_dict': model.state_dict(),
+                'model_state_dict': model.densifier.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
                 'best_val_loss': best_val_loss,
                 'args': args,
-            }, os.path.join(args.save_dir, 'best_model_joint.pth'))
+            },os.path.join(args.save_dir_DV, 'DV_best.pth'))
+            torch.save({
+                'epoch': epoch,
+                'model_state_dict': model.deblur_net.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'best_val_loss': best_val_loss,
+                'args': args,
+            }, os.path.join(args.save_dir_DSE, 'DSE_best.pth'))
             print(f"保存最佳模型，测试损失: {val_loss:.6f}")
-            torch.save(model.densifier.state_dict(),
-               os.path.join(args.save_dir, 'e_cir_best.pth'))
-            torch.save(model.deblur_net.state_dict(),
-               os.path.join(args.save_dir, 'deblur_net_best.pth'))
 
         if (epoch + 1) % args.save_every == 0:
             torch.save({
                 'epoch': epoch,
-                'model_state_dict': model.state_dict(),
+                'model_state_dict': model.densifier.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
                 'best_val_loss': best_val_loss,
                 'args': args,
-            }, os.path.join(args.save_dir, f'ckpt_joint_epoch{epoch + 1}.pth'))
-            torch.save(model.densifier.state_dict(),
-               os.path.join(args.save_dir, 'e_cir_best.pth'))
-            torch.save(model.deblur_net.state_dict(),
-               os.path.join(args.save_dir, 'deblur_net_best.pth'))
+            },os.path.join(args.save_dir_DV, f'DV_{epoch+1}.pth'))
+            torch.save({
+                'epoch': epoch,
+                'model_state_dict': model.deblur_net.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'best_val_loss': best_val_loss,
+                'args': args,
+            }, os.path.join(args.save_dir_DSE, f'DSE_{epoch+1}.pth'))
 
     print("联合训练完成！")
 
@@ -488,23 +506,30 @@ if __name__ == '__main__':
     parser.add_argument('--epochs', type=int, default=800)
     parser.add_argument('--lr', type=float, default=1e-4)
     parser.add_argument('--weight_decay', type=float, default=2e-4)
-    parser.add_argument('--drop_rate', type=float, default=0.1)
-    parser.add_argument('--attn_drop', type=float, default=0.05)
-    parser.add_argument('--drop_path_rate', type=float, default=0.05)
-    parser.add_argument('--num_workers', type=int, default=16)
+    parser.add_argument('--drop_rate', type=float, default=0.0)
+    parser.add_argument('--attn_drop', type=float, default=0.0)
+    parser.add_argument('--drop_path_rate', type=float, default=0.0)
+    parser.add_argument('--num_workers', type=int, default=8)
     parser.add_argument('--use_perceptual', action='store_true')
     parser.add_argument('--lambda_percep', type=float, default=0.1)
     parser.add_argument('--use_amp', action='store_true')
-    parser.add_argument('--save_dir', type=str, default='/root/autodl-tmp/Mymodel_Improved/model_large_ckpt')
-    parser.add_argument('--eval_log', type=str, default='/root/autodl-tmp/Mymodel_Improved/model_large_ckpt/eval.txt', help='PSNR/SSIM 记录文件')
-    parser.add_argument('--loss_log', type=str, default='/root/autodl-tmp/Mymodel_Improved/model_large_ckpt/loss_log.txt', help='损失记录文件')
-    parser.add_argument('--save_every', type=int, default=10)
-    parser.add_argument('--resume', type=str, default='/root/autodl-tmp/Mymodel_Improved/model_large_ckpt/ckpt_joint_epoch140.pth')
-    parser.add_argument('--k', type=float, default=0.8)
+    parser.add_argument('--save_dir_DSE', type=str, default='/root/autodl-tmp/Mymodel_Improved/DSE_ckpt')
+    parser.add_argument('--save_dir_DV', type=str, default='/root/autodl-tmp/Mymodel_Improved/DV_ckpt')
+    parser.add_argument('--save_dir_log', type=str, default='/root/autodl-tmp/Mymodel_Improved/DV-DSE_log')
+    parser.add_argument('--save_every', type=int, default=5)
+    parser.add_argument('--resume_DSE', type=str, default='/root/autodl-tmp/Mymodel_Improved/DSE_ckpt/DSE_80.pth')
+    parser.add_argument('--resume_DV', type=str, default='/root/autodl-tmp/Mymodel_Improved/DV_ckpt/DV_80.pth')
+    parser.add_argument('--k', type=float, default=0.5)
     parser.add_argument('--eval_every', type=int, default=5)
     parser.add_argument('--crop_size', type=int, default=320)
     parser.add_argument('--no_augment', action='store_true')
     args = parser.parse_args()
 
-    os.makedirs(args.save_dir, exist_ok=True)
+    os.makedirs(args.save_dir_DSE, exist_ok=True)
+    os.makedirs(args.save_dir_DV, exist_ok=True)
+    os.makedirs(args.save_dir_log, exist_ok=True)
     main(args)
+
+'''
+python /root/autodl-tmp/Mymodel_Improved/train_joint.py --data_root root_to_your_dataset --use_perceptual --use_amp
+'''

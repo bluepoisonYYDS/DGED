@@ -20,11 +20,11 @@ import glob
 from PIL import Image
 
 # 导入扩散模型相关类
-from diffusion_improved import FastDiffusion
+from FastDiffusion import FastDiffusion
 from unet import UNet
 
 # ============ 新增：导入冻结的 E‑CIR 模型 ============
-from DV import HeavyE_CIR   # 假设文件名为 E_CIR.py，类名 HeavyE_CIR
+from DV import DV   # 假设文件名为 DV.py，类名 DV
 
 class CenterCropTransform:
     """对 blur, sharp, voxel 进行同步中心裁剪"""
@@ -120,8 +120,8 @@ class LoadDataset(Dataset):
         voxel_np = self._load_voxel(voxel_path)   # 可能是 (H, W, 6) 或 (6, H, W)
 
         # 2. 归一化到 [-1, 1]
-        blur_np  = blur_np.astype(np.float32) / 127.5 - 1
-        sharp_np = sharp_np.astype(np.float32) / 127.5 - 1
+        blur_np  = blur_np.astype(np.float32) / 255
+        sharp_np = sharp_np.astype(np.float32) / 255
         voxel_np = normalize_voxel(voxel_np).astype(np.float32)
 
         # 3. 转为 Tensor 并调整到 (C, H, W)
@@ -171,12 +171,12 @@ def check_gradient_flow(model, save_path='gradient_flow.txt'):
         f.write("梯度流动分析报告\n")
         f.write("="*100 + "\n\n")
         sorted_indices = np.argsort(ave_grads)
-        dead_layers = [(layers[i], ave_grads[i]) for i in sorted_indices if ave_grads[i] < 1e-8]
-        weak_layers = [(layers[i], ave_grads[i]) for i in sorted_indices if 1e-8 <= ave_grads[i] < 1e-6]
-        normal_layers = [(layers[i], ave_grads[i]) for i in sorted_indices if ave_grads[i] >= 1e-6]
-        f.write(f"💀 完全消失的层 (avg < 1e-8): {len(dead_layers)} 层\n")
-        f.write(f"⚠️  梯度极弱的层 (1e-8 ≤ avg < 1e-6): {len(weak_layers)} 层\n")
-        f.write(f"✅ 梯度正常的层 (avg ≥ 1e-6): {len(normal_layers)} 层\n")
+        dead_layers = [(layers[i], ave_grads[i]) for i in sorted_indices if ave_grads[i] < 1e-10]
+        weak_layers = [(layers[i], ave_grads[i]) for i in sorted_indices if 1e-10 <= ave_grads[i] < 1e-8]
+        normal_layers = [(layers[i], ave_grads[i]) for i in sorted_indices if ave_grads[i] >= 1e-8]
+        f.write(f"💀 完全消失的层 (avg < 1e-10): {len(dead_layers)} 层\n")
+        f.write(f"⚠️  梯度极弱的层 (1e-10 ≤ avg < 1e-8): {len(weak_layers)} 层\n")
+        f.write(f"✅ 梯度正常的层 (avg ≥ 1e-8): {len(normal_layers)} 层\n")
         f.write(f"📊 总检查层数: {len(layers)}\n\n")
         if dead_layers:
             f.write("-"*100 + "\n💀 完全消失的层详情:\n" + "-"*100 + "\n")
@@ -196,9 +196,9 @@ def check_gradient_flow(model, save_path='gradient_flow.txt'):
         for i in range(top_n):
             idx = sorted_indices[i]
             status = ""
-            if ave_grads[idx] < 1e-8:
+            if ave_grads[idx] < 1e-10:
                 status = "💀 消失"
-            elif ave_grads[idx] < 1e-6:
+            elif ave_grads[idx] < 1e-8:
                 status = "⚠️ 极弱"
             f.write(f"  {i+1:3d}. {layers[idx]:70s} | 平均: {ave_grads[idx]:12.8f} | 最大: {max_grads[idx]:12.8f} | {status}\n")
         f.write("\n" + "-"*100 + "\n梯度最大的前 10 层（降序）:\n" + "-"*100 + "\n")
@@ -220,7 +220,7 @@ def build_model(args, device):
         inner_channel=args.inner_channel,
         norm_groups=args.norm_groups,
         channel_mults=args.channel_mults,
-        attn_res=args.attn_res,
+        attn_res=(((40,40), (20,20))),
         res_blocks=args.res_blocks,
         dropout=args.dropout,
         with_time_emb=True,
@@ -260,39 +260,53 @@ def train(args):
     val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False,
                             num_workers=args.num_workers, pin_memory=True)
 
-    # ============ 2. 加载冻结的 E‑CIR 模型 ============
-    print("Loading frozen E-CIR model...")
-    e_cir = HeavyE_CIR(event_bins=6, hidden_dim=128, img_feat_dim=32).to(device)
-    if args.e_cir_weights and os.path.exists(args.e_cir_weights):
-        e_cir.load_state_dict(torch.load(args.e_cir_weights, map_location=device))
-        print(f"Loaded E-CIR weights from {args.e_cir_weights}")
+    # ============ 2. 加载冻结的 DV 模型 ============
+    print("Loading frozen DV model...")
+    dv = DV(event_bins=6, hidden_dim=128, img_feat_dim=32).to(device)
+    ckpt = torch.load(args.dv_weights, map_location=device)
+    if isinstance(ckpt, dict) and 'model_state_dict' in ckpt:
+        dv.load_state_dict(ckpt['model_state_dict'])
     else:
-        print("Warning: E-CIR weights not provided or not found, using random initialization (will produce meaningless edges).")
-    e_cir.eval()
-    for param in e_cir.parameters():
+        dv.load_state_dict(ckpt)
+    print(f"Loaded DV weights from {args.dv_weights}")
+    dv.eval()
+    for param in dv.parameters():
         param.requires_grad = False
     # ===============================================
 
     # 3. 构建扩散模型
     model = build_model(args, device)
     scaler = GradScaler()
-
+    def count_parameters(model, name="Model"):
+        total_params = sum(p.numel() for p in model.parameters())
+        trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        total_M = total_params / 1e6
+        trainable_M = trainable_params / 1e6
+        print(f"[{name}] Total parameters: {total_M:.2f} M")
+        print(f"[{name}] Trainable parameters: {trainable_M:.2f} M")
     # 4. 优化器与调度器
     optimizer = Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-    scheduler = None
-
+    scheduler = CosineAnnealingLR(optimizer, T_max=args.epochs) if args.epochs > 1 else None
+    count_parameters(model, name="Diffusion Model")
     start_epoch = 0
     best_val_loss = float('inf')
     if args.resume:
         ckpt = torch.load(args.resume, map_location=device)
         model.load_state_dict(ckpt['model_state_dict'])
         optimizer.load_state_dict(ckpt['optimizer_state_dict'])
-        if scheduler is not None and 'scheduler_state_dict' in ckpt:
-            scheduler.load_state_dict(ckpt['scheduler_state_dict'])
         start_epoch = ckpt['epoch'] + 1
         best_val_loss = ckpt.get('best_val_loss', best_val_loss)
         print(f"从 epoch {start_epoch} 恢复训练")
-
+    warmup_epochs = 5
+    base_lr = args.lr
+    warmup_lr_init = 1e-6
+    def adjust_learning_rate(optimizer, epoch, warmup_epochs, base_lr, warmup_lr_init):
+        if epoch < warmup_epochs:
+            lr = warmup_lr_init + (base_lr - warmup_lr_init) * ((epoch + 1) / warmup_epochs)
+            for param_group in optimizer.param_groups:
+                param_group['lr'] = lr
+            return lr
+        return base_lr
     os.makedirs(args.save_dir, exist_ok=True)
     loss_log_path = args.loss_log if args.loss_log else os.path.join(args.save_dir, 'loss_log.txt')
     if start_epoch == 0:
@@ -302,18 +316,24 @@ def train(args):
     for epoch in range(start_epoch, args.epochs):
         model.train()
         train_losses = []
+        if epoch < warmup_epochs:
+            lr = adjust_learning_rate(optimizer, epoch, warmup_epochs, base_lr, warmup_lr_init)
+        else:
+            lr = optimizer.param_groups[0]['lr']
+        print(f"Train Epoch {epoch+1}/{args.epochs} | LR: {lr:.6f}")
+        
         pbar = tqdm(train_loader, desc=f'Epoch {epoch+1}/{args.epochs} [Train]')
         for step, batch in enumerate(pbar):
             condition = batch['condition'].to(device, non_blocking=True)  # (B,6,H,W)
             hr_voxel = batch['HR'].to(device, non_blocking=True)         # (B,6,H,W)
 
-            # ---------- 关键修改：将稀疏体素转换为稠密边缘图 ----------
             blur = condition[:, :3, :, :]   # 提取模糊图像
             with torch.no_grad():
-                edge_map = e_cir(hr_voxel, blur)   # (B,1,H,W) 稠密边缘
-            # --------------------------------------------------------
+                edge_map = dv(hr_voxel, blur)   # (B,1,H,W) 稠密边缘
 
             optimizer.zero_grad(set_to_none=True)
+            #print("shape of condition:", condition.shape, "shape of edge_map:", edge_map.shape)
+            #exit(0)
             with autocast(dtype=torch.bfloat16):
                 loss = model({'condition': condition, 'HR': edge_map})
 
@@ -342,9 +362,8 @@ def train(args):
                 condition = batch['condition'].to(device)
                 hr_voxel = batch['HR'].to(device)
 
-                # 同样用 E‑CIR 生成边缘图作为目标
                 blur = condition[:, :3, :, :]
-                edge_map = e_cir(hr_voxel, blur)
+                edge_map = dv(hr_voxel, blur)
 
                 loss = model({'condition': condition, 'HR': edge_map})
                 val_losses.append(loss.item())
@@ -369,7 +388,7 @@ def train(args):
                 'model_state_dict': model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
                 'val_loss': avg_val_loss,
-            }, os.path.join(args.save_dir, 'best_model.pth'))
+            }, os.path.join(args.save_dir, 'DGE_best.pth'))
             print(f'  -> Saved best model (val_loss={best_val_loss:.6f})')
 
         if (epoch + 1) % args.save_every == 0:
@@ -379,9 +398,9 @@ def train(args):
                 'optimizer_state_dict': optimizer.state_dict(),
                 'train_loss': avg_train_loss,
                 'val_loss': avg_val_loss,
-            }, os.path.join(args.save_dir, f'checkpoint_epoch{epoch}.pth'))
+            }, os.path.join(args.save_dir, f'DGE_{epoch+1}.pth'))
 
-        if epoch == start_epoch or (epoch + 1) % 10 == 0:
+        if epoch == start_epoch or (epoch + 1) % 1 == 0:
             save_path = os.path.join(args.save_dir, f'gradient_flow_epoch{epoch+1}.txt')
             check_gradient_flow(model, save_path=save_path)
 
@@ -398,7 +417,6 @@ if __name__ == '__main__':
     parser.add_argument('--inner_channel', type=int, default=32)
     parser.add_argument('--norm_groups', type=int, default=32)
     parser.add_argument('--channel_mults', type=int, nargs='+', default=[1,2,4,8,8])
-    parser.add_argument('--attn_res', type=int, nargs='+', default=[16])
     parser.add_argument('--res_blocks', type=int, default=2)
     parser.add_argument('--dropout', type=float, default=0.0)
     # 扩散过程
@@ -410,17 +428,16 @@ if __name__ == '__main__':
     # 训练
     parser.add_argument('--batch_size', type=int, default=4)
     parser.add_argument('--epochs', type=int, default=500)
-    parser.add_argument('--lr', type=float, default=2e-4)
+    parser.add_argument('--lr', type=float, default=5e-5)
     parser.add_argument('--weight_decay', type=float, default=0.0)
     parser.add_argument('--grad_clip', type=float, default=1.0)
     parser.add_argument('--num_workers', type=int, default=16)
     # 保存与恢复
-    parser.add_argument('--resume', type=str, default='', help='恢复训练的检查点路径')
-    parser.add_argument('--loss_log', type=str, default='/root/autodl-tmp/Mymodel_Improved/diff_ckpt/loss_log.txt', help='损失记录文件')
-    parser.add_argument('--save_dir', type=str, default='/root/autodl-tmp/Mymodel_Improved/diff_ckpt')
-    parser.add_argument('--save_every', type=int, default=5)
-    # ============ 新增：E‑CIR 权重路径 ============
-    parser.add_argument('--e_cir_weights', type=str, default='/root/autodl-tmp/Mymodel_Improved/model_large_ckpt/e_cir_best.pth', help='Path to pre-trained HeavyE_CIR weights (.pth)')
+    parser.add_argument('--resume', type=str, default='/root/autodl-tmp/Mymodel_Improved/DGE_ckpt/DGE_14.pth', help='恢复训练的检查点路径')
+    parser.add_argument('--loss_log', type=str, default='/root/autodl-tmp/Mymodel_Improved/DGE_ckpt/loss_log.txt', help='损失记录文件')
+    parser.add_argument('--save_dir', type=str, default='/root/autodl-tmp/Mymodel_Improved/DGE_ckpt')
+    parser.add_argument('--save_every', type=int, default=1)
+    parser.add_argument('--dv_weights', type=str, default='/root/autodl-tmp/Mymodel_Improved/DV_ckpt/DV_80.pth', help='Path to pre-trained dv weights')
     # =============================================
 
     args = parser.parse_args()

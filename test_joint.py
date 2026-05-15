@@ -12,8 +12,8 @@ from torch.utils.data import Dataset, DataLoader
 # ------------------------------------------------------------
 # 原始模型模块（请确保路径正确）
 # ------------------------------------------------------------
-from model_large import EventImageDeblurNet
-from DV import HeavyE_CIR
+from DSE import DSE
+from DV import DV
 from eval import evaluate_psnr_ssim          # 原训练中的评估接口
 
 
@@ -23,9 +23,9 @@ from eval import evaluate_psnr_ssim          # 原训练中的评估接口
 class JointDeblurModel(nn.Module):
     def __init__(self, deblur_net_args):
         super().__init__()
-        self.densifier = HeavyE_CIR(event_bins=6, hidden_dim=128, img_feat_dim=32)
+        self.densifier = DV(event_bins=6, hidden_dim=128, img_feat_dim=32)
         deblur_net_args['event_ch'] = 1
-        self.deblur_net = EventImageDeblurNet(**deblur_net_args)
+        self.deblur_net = DSE(**deblur_net_args)
 
     def forward(self, blur_img, event_voxel):
         edge = self.densifier(event_voxel, blur_img)   # (B,1,H,W)

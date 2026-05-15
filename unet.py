@@ -57,7 +57,8 @@ class Swish(nn.Module):
 class Downsample(nn.Module):
     def __init__(self, dim):
         super().__init__()
-        self.norm = nn.GroupNorm(min(32, dim), dim)
+        num_groups = min(dim // 4, 32) if dim >= 4 else 1
+        self.norm = nn.GroupNorm(num_groups, dim)
         self.act = nn.SiLU()
         self.conv = nn.Conv2d(dim, dim, 3, 2, 1)
     def forward(self, x):
@@ -67,7 +68,8 @@ class Upsample(nn.Module):
     def __init__(self, dim):
         super().__init__()
         self.up = nn.Upsample(scale_factor=2, mode="nearest")
-        self.norm = nn.GroupNorm(min(32, dim), dim)
+        num_groups = min(dim // 4, 32) if dim >= 4 else 1
+        self.norm = nn.GroupNorm(num_groups, dim)
         self.act = nn.SiLU()
         self.conv = nn.Conv2d(dim, dim, 3, padding=1)
     def forward(self, x):
@@ -118,7 +120,7 @@ class ResnetBlock(nn.Module):
         self.shortcut_norm = nn.GroupNorm(min(32, dim_out), dim_out)
 
         # 主路径可学习缩放，初始为 0（训练初期完全恒等，杜绝方差）
-        self.gamma = nn.Parameter(torch.zeros(1, dim_out, 1, 1))
+        self.gamma = nn.Parameter(torch.ones(1, dim_out, 1, 1) * 0.1)
 
     def forward(self, x, time_emb):
         # 主路径（Pre-Activation）
@@ -210,11 +212,11 @@ class UNet(nn.Module):
         inner_channel=32,
         norm_groups=32,
         channel_mults=(1, 2, 4, 8, 8),
-        attn_res=((40, 30),),   # 改为元组列表，例如在 40×30 时启用注意力
+        attn_res=((40, 40),),   # 改为元组列表，例如在 40×30 时启用注意力
         res_blocks=3,
         dropout=0,
         with_time_emb=True,
-        image_size=(640, 480)   # 修改为 (H, W)
+        image_size=(320, 320)   # 修改为 (H, W)
     ):
         super().__init__()
 
