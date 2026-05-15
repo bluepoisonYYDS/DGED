@@ -320,16 +320,16 @@ class DecoderStage(nn.Module):
 
 # -------------------- 完整模型 --------------------
 class DSE(nn.Module):
-    def __init__(self, img_ch=3, event_ch=1, base_ch=16, window_size=8,
+    def __init__(self, img_ch=3, event_ch=1, base_ch=64, up_ch=16, window_size=8,
                  drop_rate=0.02,        # 全局 Dropout 率
                  attn_drop=0.05,        # Attention 内部的 Dropout 率
                  drop_path_rate=0.02,   # DropPath 率（一般 0.1~0.2）
                  mlp_ratio=4.0):
         super().__init__()
         self.window_size = window_size
-        self.stem_conv = ConvLayer(img_ch, base_ch, drop_rate=drop_rate)
+        self.stem_conv = ConvLayer(img_ch, up_ch, drop_rate=drop_rate)
         self.event_norm = nn.BatchNorm2d(event_ch)
-        self.fuse_conv = ConvLayer(base_ch + event_ch, base_ch, drop_rate=drop_rate)
+        self.fuse_conv = ConvLayer(up_ch + event_ch, base_ch, drop_rate=drop_rate)
 
         # 编码器
         self.enc_stage1 = EncoderStage(base_ch, base_ch * 2,
@@ -436,7 +436,7 @@ if __name__ == "__main__":
 
     # 初始化模型，启用所有正则化（drop_rate=0.1, drop_path=0.1）
     model = DSE(
-        img_ch=3, event_ch=6, base_ch=64, window_size=8,
+        img_ch=3, event_ch=6, base_ch=64, up_ch=16, window_size=8,
         drop_rate=0.1, attn_drop=0.1, drop_path_rate=0.1
     ).to(device)
 

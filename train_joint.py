@@ -354,6 +354,7 @@ def main(args):
     deblur_net_args = dict(
         img_ch=3,
         base_ch=args.base_ch,
+        up_ch=args.up_ch,
         window_size=args.window_size,
         drop_rate=args.drop_rate,
         attn_drop=args.attn_drop,
@@ -501,6 +502,7 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--data_root', type=str, required=True)
     parser.add_argument('--base_ch', type=int, default=64)
+    parser.add_argument('--up_ch', type=int, default=16)
     parser.add_argument('--window_size', type=int, default=8)
     parser.add_argument('--batch_size', type=int, default=2)
     parser.add_argument('--epochs', type=int, default=800)
@@ -517,8 +519,8 @@ if __name__ == '__main__':
     parser.add_argument('--save_dir_DV', type=str, default='/root/autodl-tmp/Mymodel_Improved/DV_ckpt')
     parser.add_argument('--save_dir_log', type=str, default='/root/autodl-tmp/Mymodel_Improved/DV-DSE_log')
     parser.add_argument('--save_every', type=int, default=5)
-    parser.add_argument('--resume_DSE', type=str, default='/root/autodl-tmp/Mymodel_Improved/DSE_ckpt/DSE_80.pth')
-    parser.add_argument('--resume_DV', type=str, default='/root/autodl-tmp/Mymodel_Improved/DV_ckpt/DV_80.pth')
+    parser.add_argument('--resume_DSE', type=str, default='')
+    parser.add_argument('--resume_DV', type=str, default='')
     parser.add_argument('--k', type=float, default=0.5)
     parser.add_argument('--eval_every', type=int, default=5)
     parser.add_argument('--crop_size', type=int, default=320)
